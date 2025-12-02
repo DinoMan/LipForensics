@@ -46,7 +46,6 @@ def read_video_cv2(path):
         raise RuntimeError(f"No frames read from video: {path}")
 
     video = np.stack(frames, axis=0)  # (T, H, W, C)
-    video = video[:25]
     return video, fps
 
 
