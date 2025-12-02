@@ -9,12 +9,13 @@ import torch
 from torch.utils.data import DataLoader
 from torchvision.transforms import Compose, CenterCrop
 from tqdm import tqdm
-
+import face_alignment
 from data.transforms import NormalizeVideo, ToTensorVideo
 from data.dataset_clips import ForensicsClips, CelebDFClips, DFDCClips
 from data.samplers import ConsecutiveClipSampler
 from models.spatiotemporal_net import get_model
 from utils import get_files_from_split
+from preprocessing.crop_mouths import crop_video
 
 
 def parse_args():
@@ -47,6 +48,8 @@ def parse_args():
     parser.add_argument("--rgb", dest="grayscale", action="store_false")
     parser.set_defaults(grayscale=True)
     parser.add_argument("--frames_per_clip", default=25, type=int)
+    parser.add_argument("--stride", default=25, type=int)
+
     parser.add_argument("--batch_size", default=32, type=int)
     parser.add_argument("--device", help="Device to put tensors on", type=str, default="cuda:0")
     parser.add_argument("--num_workers", default=4, type=int)
@@ -124,56 +127,48 @@ def validate_video_level(model, loader, args):
     return auc_video
 
 
+def save_video(x, output_path="out.mp4"):
+    
+    import torch
+    import numpy as np
+    import imageio
+
+    video = x  # [T, 1, H, W], values 0–1 or 0–255
+
+    # Convert to uint8 HxW for each frame
+    frames = (video[:, 0] * 255).clamp(0, 255).byte().cpu().numpy()  # shape [T, H, W]
+
+    imageio.mimsave(output_path, frames, fps=25, codec="libx264", quality=8, pixelformat="gray")
+
+
 def main():
     args = parse_args()
 
-    model = get_model(weights_forgery_path=args.weights_forgery_path)
+    model = get_model(weights_forgery_path=args.weights_forgery_path, device="cuda:0").eval()
 
-    # Get dataset
+    fa = face_alignment.FaceAlignment(face_alignment.LandmarksType.TWO_D, device="cuda", flip_input=False)
+
     transform = Compose(
         [ToTensorVideo(), CenterCrop((88, 88)), NormalizeVideo((0.421,), (0.165,))]
     )
-    if args.dataset in [
-        "FaceForensics++",
-        "Deepfakes",
-        "FaceSwap",
-        "Face2Face",
-        "NeuralTextures",
-        "FaceShifter",
-        "DeeperForensics",
-    ]:
-        if args.dataset == "FaceForensics++":
-            fake_types = ("Deepfakes", "FaceSwap", "Face2Face", "NeuralTextures")
-        else:
-            fake_types = (args.dataset,)
 
-        test_split = pd.read_json(args.split_path, dtype=False)
-        test_files_real, test_files_fake = get_files_from_split(test_split)
+    for video_path in ["/home/dino/Documents/git/LipForensics/data/datasets/custom/nt_015_919_with_audio.mp4"]:
+        
+        import torchvision.io as io
 
-        dataset = ForensicsClips(
-            test_files_real,
-            test_files_fake,
-            args.frames_per_clip,
-            grayscale=args.grayscale,
-            compression=args.compression,
-            fakes=fake_types,
-            transform=transform,
-            max_frames_per_video=110,
-        )
-    elif args.dataset == "CelebDF":
-        dataset = CelebDFClips(args.frames_per_clip, args.grayscale, transform)
-    else:
-        metadata = pd.read_json(args.dfdc_metadata_path).T
-        dataset = DFDCClips(args.frames_per_clip, metadata, args.grayscale, transform)
+        # Returns video: (T, H, W, C), audio: (num_channels, num_samples)
+        video, audio, info = io.read_video(video_path, pts_unit='sec')
 
-    # Get sampler that splits video into non-overlapping clips
-    sampler = ConsecutiveClipSampler(dataset.clips_per_video)
-
-    loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, num_workers=args.num_workers)
-
-    auc = validate_video_level(model, loader, args)
-    print(args.dataset, f"AUC (video-level): {auc}")
-
+        adjusted_length = (video.shape[0] // args.frames_per_clip) * args.frames_per_clip
+        
+        vid = crop_video(video[:adjusted_length], fa)
+        cropped_video = transform(vid)
+        save_video(cropped_video, output_path="after.mp4")
+        video_clips = cropped_video.unfold(dimension=0, size=args.frames_per_clip, step=args.stride).permute(0, 1, 4, 2, 3).cuda()
+        with torch.no_grad():
+            logits = model(video_clips, lengths=[args.frames_per_clip] * video_clips.shape[0])
+        print("Logits:", logits)
+        print(logits.mean().item())
 
 if __name__ == "__main__":
     main()
