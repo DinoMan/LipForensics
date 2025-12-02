@@ -5,12 +5,12 @@ Lipreading_using_Temporal_Convolutional_Networks/blob/master/preprocessing/crop_
 import argparse
 import os
 from collections import deque
-
+import torch
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
-
-from utils import warp_img, apply_transform, cut_patch
+import torchvision.transforms.functional as F
+from .utils import warp_img, apply_transform, cut_patch
 
 
 DATASETS = {
@@ -74,6 +74,65 @@ def parse_args():
     args = parser.parse_args()
     return args
 
+def crop_video(video, fa):
+    mean_face_landmarks = np.load("./preprocessing/20words_mean_face.npy")
+    window_margin = 12
+    start_idx = 48
+    stop_idx = 68
+    crop_height = 96
+    crop_width = 96
+    q_frames, q_landmarks = deque(), deque()
+    
+    output_frames = []
+    print("preprocessing...")
+    for i, frame in tqdm(enumerate(video)):
+        img = frame.numpy()
+        landmarks = fa.get_landmarks(img)[0]
+        # Add elements to the queues
+        q_frames.append(img)
+        q_landmarks.append(landmarks)
+
+        if len(q_frames) == window_margin:  # Wait until queues are large enough
+            smoothed_landmarks = np.mean(q_landmarks, axis=0)
+
+            cur_landmarks = q_landmarks.popleft()
+            cur_frame = q_frames.popleft()
+
+            # Get aligned frame as well as affine transformation that produced it
+            trans_frame, trans = warp_img(
+                smoothed_landmarks[STABLE_POINTS, :], mean_face_landmarks[STABLE_POINTS, :], cur_frame, STD_SIZE
+            )
+
+            # Apply that affine transform to the landmarks
+            trans_landmarks = trans(cur_landmarks)
+
+            # Crop mouth region
+            cropped_frame = cut_patch(
+                trans_frame,
+                trans_landmarks[start_idx : stop_idx],
+                crop_height // 2,
+                crop_width // 2,
+            )
+    
+            # Save image
+            output_frames.append(cropped_frame)
+
+    # Process remaining frames in the queue
+    while q_frames:
+        cur_frame = q_frames.popleft()
+        cur_landmarks = q_landmarks.popleft()
+
+        trans_frame = apply_transform(trans, cur_frame, STD_SIZE)
+        trans_landmarks = trans(cur_landmarks)
+
+        cropped_frame = cut_patch(
+            trans_frame, trans_landmarks[start_idx : stop_idx], crop_height // 2, crop_width // 2
+        )
+
+
+        output_frames.append(cropped_frame)
+    out_vid = F.rgb_to_grayscale(torch.Tensor(np.stack(output_frames)).permute(0, 3, 1, 2))
+    return out_vid
 
 def crop_video_and_save(video_path, landmarks_dir, target_dir, mean_face_landmarks, args):
     """ "

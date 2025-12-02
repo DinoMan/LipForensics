@@ -12,7 +12,7 @@ def to_tensor(clip):
     clip : torch.tensor
         video clip
     """
-    return clip.float().permute(3, 0, 1, 2) / 255.0
+    return clip.float() / 255.0
 
 
 def normalize(clip, mean, std):
