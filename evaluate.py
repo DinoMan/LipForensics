@@ -2,6 +2,7 @@
 
 import argparse
 from collections import defaultdict
+from xml.parsers.expat import model
 
 import pandas as pd
 from sklearn import metrics
@@ -16,6 +17,141 @@ from data.samplers import ConsecutiveClipSampler
 from models.spatiotemporal_net import get_model
 from utils import get_files_from_split
 from preprocessing.crop_mouths import crop_video
+
+
+import torch
+import torch.nn.functional as F
+
+
+import torch
+import numpy as np
+import cv2
+
+def save_cam_overlay_video(video_gray: torch.Tensor,
+                           cam: torch.Tensor,
+                           out_path: str,
+                           fps: int = 30,
+                           alpha: float = 0.6,
+                           colormap: int = cv2.COLORMAP_JET):
+    """
+    video_gray: [T, H, W] tensor (values in [0,1] or [0,255])
+    cam:        [T, H, W] tensor (can be any range, normalized per-frame)
+    out_path:   output .mp4 filename
+    fps:        frames per second
+    alpha:      blending weight for grayscale frame (heatmap weight = 1-alpha)
+    colormap:   OpenCV colormap, e.g. cv2.COLORMAP_JET
+    """
+
+    assert video_gray.shape == cam.shape, "video_gray and cam must be same shape [T,H,W]"
+
+    T, H, W = video_gray.shape
+
+    # Prepare video writer
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(out_path, fourcc, fps, (W, H))
+
+    # Convert to numpy
+    video_np = video_gray.detach().cpu().numpy()
+    cam_np = cam.detach().cpu().numpy()
+
+    for t in range(T):
+        frame = video_np[t]
+        cam_t = cam_np[t]
+
+        # --- Normalize grayscale frame to [0,255] ---
+        if frame.max() <= 1.0:
+            frame_uint8 = (frame * 255).astype(np.uint8)
+        else:
+            frame_uint8 = frame.astype(np.uint8)
+
+        frame_bgr = cv2.cvtColor(frame_uint8, cv2.COLOR_GRAY2BGR)
+
+        # --- Normalize CAM per frame ---
+        cam_t = cam_t - cam_t.min()
+        if cam_t.max() > 0:
+            cam_t = cam_t / cam_t.max()
+
+        cam_uint8 = (cam_t * 255).astype(np.uint8)
+
+        # --- Build heatmap ---
+        heatmap = cv2.applyColorMap(cam_uint8, colormap)
+
+        # --- Blend grayscale + heatmap ---
+        overlay = cv2.addWeighted(frame_bgr, alpha, heatmap, 1 - alpha, 0)
+
+        writer.write(overlay)
+
+    writer.release()
+    print(f"[OK] Saved CAM overlay video → {out_path}")
+
+
+class GradCAM3D:
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+
+        self.A = None    # activations: [C, T', H', W']
+        self.G = None    # gradients:    [C, T', H', W']
+
+        target_layer.register_forward_hook(self._forward_hook)
+        target_layer.register_full_backward_hook(self._backward_hook)
+
+    def _forward_hook(self, module, inp, out):
+        # out: [C, T', H', W']
+        self.A = out
+
+    def _backward_hook(self, module, grad_input, grad_output):
+        # grad_output[0]: [C, T', H', W']
+        self.G = grad_output[0]
+
+    def __call__(self, batch, lengths, time_agg="none"):            
+        """
+        x: [B, C, T, H, W]
+        """
+        cams = []
+        for i, x in enumerate(batch):
+            x = x.unsqueeze(0)  # [1, C, T, H, W]
+            self.model.zero_grad()
+
+            # Forward → [1, 1] single logit
+            logit = self.model(x, lengths=[lengths[i]])[0, 0]
+            logit.backward()
+
+            A = self.A          # [C, T', H', W']
+            G = self.G          # [C, T', H', W']
+
+            # === 1. Compute channel weights α_c (GAP over T'H'W') ===
+            # weights: [C, 1, 1, 1]
+            weights = G.mean(dim=(1, 2, 3), keepdim=True)
+
+            # === 2. Weighted sum over channels ===
+            # A is [C, T', H', W'], weights is [C, 1, 1, 1]
+            cam = (weights * A).sum(dim=0, keepdim=True)   # [1, T', H', W']
+            cam = F.relu(cam)
+
+            # === 3. Normalize to [0, 1] ===
+            cam = cam - cam.min()
+            cam = cam / (cam.max() + 1e-8)
+
+            # === 4. Upsample to full video size ===
+            _, _, T, H, W = x.shape      # input shape
+            cam = F.interpolate(
+                cam.unsqueeze(0),        # [1,1,T',H',W']
+                size=(T, H, W),
+                mode="trilinear",
+                align_corners=False
+            )[0, 0]                      # → [T, H, W]
+            cams.append(cam)
+            
+        cam = torch.cat(cams, dim=0)  # [B, T, H, W]
+        if time_agg == "mean":
+            return cam, cam.mean(dim=0)   # [T,H,W], [H,W]
+        elif time_agg == "max":
+            return cam, cam.max(dim=0)[0] # [T,H,W], [H,W]
+        else:
+            return cam, None
+
+
 
 
 def parse_args():
@@ -151,8 +287,10 @@ def main():
     transform = Compose(
         [ToTensorVideo(), CenterCrop((88, 88)), NormalizeVideo((0.421,), (0.165,))]
     )
-
-    for video_path in ["/home/dino/Documents/git/LipForensics/data/datasets/custom/nt_015_919_with_audio.mp4"]:
+    
+    target_layer = model.trunk.layer3
+    cam_extractor = GradCAM3D(model, target_layer)
+    for video_path in ["/home/dino/Documents/git/LipForensics/data/datasets/custom/015_with_audio.mp4"]:
         
         import torchvision.io as io
 
@@ -160,11 +298,17 @@ def main():
         video, audio, info = io.read_video(video_path, pts_unit='sec')
 
         adjusted_length = (video.shape[0] // args.frames_per_clip) * args.frames_per_clip
-        
         vid = crop_video(video[:adjusted_length], fa)
+
+        save_video(vid/255, output_path="before.mp4")
         cropped_video = transform(vid)
         save_video(cropped_video, output_path="after.mp4")
         video_clips = cropped_video.unfold(dimension=0, size=args.frames_per_clip, step=args.stride).permute(0, 1, 4, 2, 3).cuda()
+        
+        cam = cam_extractor(video_clips, lengths=[args.frames_per_clip] * video_clips.shape[0])[0]
+        
+        save_cam_overlay_video(CenterCrop((88, 88))(vid).squeeze(), cam, fps=30, out_path="cam_overlay.mp4")
+        
         with torch.no_grad():
             logits = model(video_clips, lengths=[args.frames_per_clip] * video_clips.shape[0])
         print("Logits:", logits)
@@ -172,3 +316,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
