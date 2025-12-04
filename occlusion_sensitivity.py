@@ -6,6 +6,7 @@ import cv2
 import imageio
 import matplotlib.pyplot as plt
 import numpy as np
+from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torchvision.transforms import Compose, CenterCrop
@@ -95,25 +96,19 @@ def compute_clip_sensitivity(
     return heat.detach().cpu()
 
 
-def normalize_heatmap_per_frame(heat):
+def normalize_heatmap_per_video(heat):
     """
     heat: [T, H, W] tensor on CPU
-    Returns: [T, H, W] normalized to [0, 1] per frame
+    Returns: [T, H, W] normalized to [0, 1] per whole video
     """
-    T, H, W = heat.shape
-    heat_np = heat.numpy()
-    norm = np.zeros_like(heat_np, dtype=np.float32)
-
-    for t in range(T):
-        hm = heat_np[t]
-        max_val = hm.max()
-        min_val = hm.min()
-        if max_val > min_val:
-            norm[t] = (hm - min_val) / (max_val - min_val + 1e-8)
-        else:
-            norm[t] = 0.0
-
-    return torch.from_numpy(norm)
+    heat_np = heat.numpy().astype(np.float32)
+    max_val = heat_np.max()
+    min_val = heat_np.min()
+    if max_val > min_val:
+        norm = (heat_np - min_val) / (max_val - min_val + 1e-8)
+    else:
+        norm = np.zeros_like(heat_np, dtype=np.float32)
+    return norm
 
 
 def overlay_heatmap_on_frames(frames_gray, heatmaps, alpha=0.6):
@@ -138,6 +133,7 @@ def overlay_heatmap_on_frames(frames_gray, heatmaps, alpha=0.6):
         out_frames.append(overlay)
 
     return out_frames
+
 
 
 def save_video(frames_rgb, fps, output_path):
@@ -172,8 +168,6 @@ def parse_args():
 
     parser.add_argument("--video", type=str, required=True,
                         help="Path to input video (full face)")
-    parser.add_argument("--output", type=str, default="occlusion_overlay.mp4",
-                        help="Path to output occlusion video")
     parser.add_argument("--frames_per_clip", type=int, default=25,
                         help="Number of frames per clip (must match model)")
     parser.add_argument("--stride", type=int, default=25,
@@ -295,7 +289,7 @@ def main():
     video_heatmap = torch.cat(all_heatmaps, dim=0)  # [T_adj, H, W] on CPU
 
     # Normalize per frame to [0,1]
-    video_heatmap_norm = normalize_heatmap_per_frame(video_heatmap).numpy()  # [T_adj, H, W]
+    video_heatmap_norm = normalize_heatmap_per_video(video_heatmap)  # [T_adj, H, W]
 
     # Prepare grayscale frames for overlay
     frames_gray = cropped_unnorm.squeeze(1).cpu().numpy()  # [T_adj, 88, 88]
@@ -305,8 +299,9 @@ def main():
     frames_rgb = overlay_heatmap_on_frames(frames_gray, video_heatmap_norm, alpha=0.6)
 
     # ---- Save video ----
-    print(f"Saving to {args.output} (fps={fps})")
-    save_video(frames_rgb, fps=fps, output_path=args.output)
+    output_path = args.video.split(".")[0] + "_occlusion_sensitivity" + "." + args.video.split(".")[1]
+    print(f"Saving to output_path (fps={fps})")
+    save_video(frames_rgb, fps=fps, output_path=output_path)
     print("Done.")
 
 

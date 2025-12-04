@@ -70,7 +70,7 @@ dependencies:
   - zstd=1.5.7
   - pip:
       - certifi==2021.5.30
-      - face-alignment==1.4.2
+      - face-alignment @ git+https://github.com/1adrianb/face-alignment@bacd0afb400a46ce4e94bf231624591495d932a2
       - imageio==2.35.1
       - importlib-metadata==8.5.0
       - joblib==1.0.1
