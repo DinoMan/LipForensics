@@ -4,6 +4,7 @@ from collections import defaultdict
 
 import cv2
 import imageio
+import math
 import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
@@ -61,6 +62,8 @@ def compute_clip_sensitivity(
     base_logit,        # scalar float
     patch_size,
     patch_stride,
+    temp_size,
+    temp_stride,
     device,
     frames_per_clip,
 ):
@@ -77,17 +80,22 @@ def compute_clip_sensitivity(
     heat = torch.zeros((T, H, W), device=device)
     counts = torch.zeros((T, H, W), device=device)
 
-    for t in tqdm(range(T)):
+    base_prob = 1.0 / (1.0 + math.exp(-base_logit))
+
+    for t in tqdm(range(0, T - temp_size + 1, temp_stride)):
         for y in range(0, H - patch_size + 1, patch_stride):
             for x in range(0, W - patch_size + 1, patch_stride):
                 occluded = clip.clone()
-                occluded[0, t, 0, y:y+patch_size, x:x+patch_size] = 0.0
+                occluded[0, t:t+temp_size, 0, y:y+patch_size, x:x+patch_size] = 0.0
 
                 logit_occ = model(occluded.permute(0, 2, 1, 3, 4), lengths=[frames_per_clip])[0].item()
-                delta = base_logit - logit_occ
 
-                heat[t, y:y+patch_size, x:x+patch_size] += delta
-                counts[t, y:y+patch_size, x:x+patch_size] += 1
+                occ_prob = 1.0 / (1.0 + math.exp(-logit_occ))
+
+                delta = base_prob - occ_prob
+
+                heat[t:t+temp_size, y:y+patch_size, x:x+patch_size] += delta
+                counts[t:t+temp_size, y:y+patch_size, x:x+patch_size] += 1
 
     counts = torch.where(counts == 0, torch.ones_like(counts), counts)
     heat = heat / counts
@@ -173,9 +181,13 @@ def parse_args():
     parser.add_argument("--stride", type=int, default=25,
                         help="Temporal stride between clips (use 25 for non-overlapping)")
     parser.add_argument("--patch_size", type=int, default=11,
-                        help="Spatial occlusion patch size (square)")
+                        help="Spatial occlusion size")
     parser.add_argument("--patch_stride", type=int, default=5,
-                        help="Stride between occlusion patches")
+                        help="Spatial stride between occlusion blocks")
+    parser.add_argument("--temp_size", type=int, default=5,
+                        help="Temporal occlusion size")
+    parser.add_argument("--temp_stride", type=int, default=2,
+                        help="Temporal stride between occlusion blocks")
     parser.add_argument("--device", type=str, default="cuda:0",
                         help="Device for the model, e.g. 'cuda:0' or 'cpu'")
     parser.add_argument("--weights_forgery_path", type=str,
@@ -223,6 +235,7 @@ def main():
     # ---- Read video with OpenCV ----
     print(f"Reading video (OpenCV): {args.video}")
     video_np, fps = read_video_cv2(args.video)  # [T, H, W, C], uint8
+
     T_total = video_np.shape[0]
     frames_per_clip = args.frames_per_clip
 
@@ -243,7 +256,7 @@ def main():
     # Ensure numpy before transforms
     if hasattr(vid_cropped, "numpy"):
         vid_cropped = vid_cropped.numpy()
-    vid_cropped = vid_cropped.astype(np.uint8)
+    # vid_cropped = vid_cropped.astype(np.uint8)
 
     # ---- Apply model transform (ToTensorVideo -> grayscale, crop, normalize) ----
     cropped_video = transform(torch.tensor(vid_cropped))  # [T_adj, 1, 88, 88]
@@ -280,6 +293,8 @@ def main():
             base_logit=base_logits[i].item(),
             patch_size=args.patch_size,
             patch_stride=args.patch_stride,
+            temp_size=args.temp_size,
+            temp_stride=args.temp_stride,
             device=device,
             frames_per_clip=frames_per_clip,
         )  # [T, H, W] on CPU
@@ -299,7 +314,7 @@ def main():
     frames_rgb = overlay_heatmap_on_frames(frames_gray, video_heatmap_norm, alpha=0.6)
 
     # ---- Save video ----
-    output_path = args.video.split(".")[0] + "_occlusion_sensitivity" + "." + args.video.split(".")[1]
+    output_path = args.video.split(".")[0] + "_occlusion_sensitivity_4" + "." + args.video.split(".")[1]
     print(f"Saving to output_path (fps={fps})")
     save_video(frames_rgb, fps=fps, output_path=output_path)
     print("Done.")
